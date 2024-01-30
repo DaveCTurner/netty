@@ -42,9 +42,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <a href="https://www.facebook.com/notes/facebook-engineering/scalable-memory-allocation-using-jemalloc/480222803919">
  * Scalable memory allocation using jemalloc</a>.
  */
-final class PoolThreadCache extends PoolArenasCache {
+final class PoolThreadCache {
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PoolThreadCache.class);
+    private static final int INTEGER_SIZE_MINUS_ONE = Integer.SIZE - 1;
+
+    final PoolArena<byte[]> heapArena;
+    final PoolArena<ByteBuffer> directArena;
+
     // Hold the caches for the different size classes, which are small and normal.
     private final MemoryRegionCache<byte[]>[] smallSubPageHeapCaches;
     private final MemoryRegionCache<ByteBuffer>[] smallSubPageDirectCaches;
@@ -53,6 +58,8 @@ final class PoolThreadCache extends PoolArenasCache {
 
     private final int freeSweepAllocationThreshold;
     private final AtomicBoolean freed = new AtomicBoolean();
+    @SuppressWarnings("unused") // Field is only here for the finalizer.
+    private final FreeOnFinalize freeOnFinalize;
 
     private int allocations;
 
@@ -61,17 +68,14 @@ final class PoolThreadCache extends PoolArenasCache {
 
     PoolThreadCache(PoolArena<byte[]> heapArena, PoolArena<ByteBuffer> directArena,
                     int smallCacheSize, int normalCacheSize, int maxCachedBufferCapacity,
-                    int freeSweepAllocationThreshold) {
-        super(heapArena, directArena);
+                    int freeSweepAllocationThreshold, boolean useFinalizer) {
         checkPositiveOrZero(maxCachedBufferCapacity, "maxCachedBufferCapacity");
         this.freeSweepAllocationThreshold = freeSweepAllocationThreshold;
+        this.heapArena = heapArena;
+        this.directArena = directArena;
         if (directArena != null) {
-            smallSubPageDirectCaches = createSubPageCaches(
-                    smallCacheSize, directArena.numSmallSubpagePools);
-
-            normalDirectCaches = createNormalCaches(
-                    normalCacheSize, maxCachedBufferCapacity, directArena);
-
+            smallSubPageDirectCaches = createSubPageCaches(smallCacheSize, directArena.sizeClass.nSubpages);
+            normalDirectCaches = createNormalCaches(normalCacheSize, maxCachedBufferCapacity, directArena);
             directArena.numThreadCaches.getAndIncrement();
         } else {
             // No directArea is configured so just null out all caches
@@ -80,12 +84,8 @@ final class PoolThreadCache extends PoolArenasCache {
         }
         if (heapArena != null) {
             // Create the caches for the heap allocations
-            smallSubPageHeapCaches = createSubPageCaches(
-                    smallCacheSize, heapArena.numSmallSubpagePools);
-
-            normalHeapCaches = createNormalCaches(
-                    normalCacheSize, maxCachedBufferCapacity, heapArena);
-
+            smallSubPageHeapCaches = createSubPageCaches(smallCacheSize, heapArena.sizeClass.nSubpages);
+            normalHeapCaches = createNormalCaches(normalCacheSize, maxCachedBufferCapacity, heapArena);
             heapArena.numThreadCaches.getAndIncrement();
         } else {
             // No heapArea is configured so just null out all caches
@@ -100,6 +100,7 @@ final class PoolThreadCache extends PoolArenasCache {
             throw new IllegalArgumentException("freeSweepAllocationThreshold: "
                     + freeSweepAllocationThreshold + " (expected: > 0)");
         }
+        freeOnFinalize = useFinalizer ? new FreeOnFinalize(this) : null;
     }
 
     private static <T> MemoryRegionCache<T>[] createSubPageCaches(
@@ -121,11 +122,12 @@ final class PoolThreadCache extends PoolArenasCache {
     private static <T> MemoryRegionCache<T>[] createNormalCaches(
             int cacheSize, int maxCachedBufferCapacity, PoolArena<T> area) {
         if (cacheSize > 0 && maxCachedBufferCapacity > 0) {
-            int max = Math.min(area.chunkSize, maxCachedBufferCapacity);
+            int max = Math.min(area.sizeClass.chunkSize, maxCachedBufferCapacity);
             // Create as many normal caches as we support based on how many sizeIdx we have and what the upper
             // bound is that we want to cache in general.
             List<MemoryRegionCache<T>> cache = new ArrayList<MemoryRegionCache<T>>() ;
-            for (int idx = area.numSmallSubpagePools; idx < area.nSizes && area.sizeIdx2size(idx) <= max ; idx++) {
+            for (int idx = area.sizeClass.nSubpages; idx < area.sizeClass.nSizes &&
+                    area.sizeClass.sizeIdx2size(idx) <= max; idx++) {
                 cache.add(new NormalMemoryRegionCache<T>(cacheSize));
             }
             return cache.toArray(new MemoryRegionCache[0]);
@@ -134,10 +136,14 @@ final class PoolThreadCache extends PoolArenasCache {
         }
     }
 
+    // val > 0
+    static int log2(int val) {
+        return INTEGER_SIZE_MINUS_ONE - Integer.numberOfLeadingZeros(val);
+    }
+
     /**
      * Try to allocate a small buffer out of the cache. Returns {@code true} if successful {@code false} otherwise
      */
-    @Override
     boolean allocateSmall(PoolArena<?> area, PooledByteBuf<?> buf, int reqCapacity, int sizeIdx) {
         return allocate(cacheForSmall(area, sizeIdx), buf, reqCapacity);
     }
@@ -145,7 +151,6 @@ final class PoolThreadCache extends PoolArenasCache {
     /**
      * Try to allocate a normal buffer out of the cache. Returns {@code true} if successful {@code false} otherwise
      */
-    @Override
     boolean allocateNormal(PoolArena<?> area, PooledByteBuf<?> buf, int reqCapacity, int sizeIdx) {
         return allocate(cacheForNormal(area, sizeIdx), buf, reqCapacity);
     }
@@ -169,10 +174,9 @@ final class PoolThreadCache extends PoolArenasCache {
      * Returns {@code true} if it fit into the cache {@code false} otherwise.
      */
     @SuppressWarnings({ "unchecked", "rawtypes" })
-    @Override
     boolean add(PoolArena<?> area, PoolChunk chunk, ByteBuffer nioBuffer,
                 long handle, int normCapacity, SizeClass sizeClass) {
-        int sizeIdx = area.size2SizeIdx(normCapacity);
+        int sizeIdx = area.sizeClass.size2SizeIdx(normCapacity);
         MemoryRegionCache<?> cache = cache(area, sizeIdx, sizeClass);
         if (cache == null) {
             return false;
@@ -194,20 +198,9 @@ final class PoolThreadCache extends PoolArenasCache {
         }
     }
 
-    /// TODO: In the future when we move to Java9+ we should use java.lang.ref.Cleaner.
-    @Override
-    protected void finalize() throws Throwable {
-        try {
-            super.finalize();
-        } finally {
-            free(true);
-        }
-    }
-
     /**
      *  Should be called if the Thread that uses this cache is about to exist to release resources out of the cache
      */
-    @Override
     void free(boolean finalizer) {
         // As free() may be called either by the finalizer or by FastThreadLocal.onRemoval(...) we need to ensure
         // we only call this one time.
@@ -266,7 +259,6 @@ final class PoolThreadCache extends PoolArenasCache {
         return cache.free(finalizer);
     }
 
-    @Override
     void trim() {
         trim(smallSubPageDirectCaches);
         trim(normalDirectCaches);
@@ -298,8 +290,8 @@ final class PoolThreadCache extends PoolArenasCache {
     }
 
     private MemoryRegionCache<?> cacheForNormal(PoolArena<?> area, int sizeIdx) {
-        // We need to substract area.numSmallSubpagePools as sizeIdx is the overall index for all sizes.
-        int idx = sizeIdx - area.numSmallSubpagePools;
+        // We need to subtract area.sizeClass.nSubpages as sizeIdx is the overall index for all sizes.
+        int idx = sizeIdx - area.sizeClass.nSubpages;
         if (area.isDirect()) {
             return cache(normalDirectCaches, idx);
         }
@@ -489,5 +481,24 @@ final class PoolThreadCache extends PoolArenasCache {
                 return new Entry(handle);
             }
         });
+    }
+
+    private static final class FreeOnFinalize {
+        private final PoolThreadCache cache;
+
+        private FreeOnFinalize(PoolThreadCache cache) {
+            this.cache = cache;
+        }
+
+        /// TODO: In the future when we move to Java9+ we should use java.lang.ref.Cleaner.
+        @SuppressWarnings({"FinalizeDeclaration", "deprecation"})
+        @Override
+        protected void finalize() throws Throwable {
+            try {
+                super.finalize();
+            } finally {
+                cache.free(true);
+            }
+        }
     }
 }

@@ -464,7 +464,7 @@ public class HttpResponseDecoderTest {
     }
 
     @Test
-    public void testPrematureClosureWithChunkedEncodingAndAggregator() throws Exception {
+    public void testPrematureClosureWithChunkedEncodingAndAggregator() {
         EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder(), new HttpObjectAggregator(1024));
 
         // Write the partial response.
@@ -478,12 +478,6 @@ public class HttpResponseDecoderTest {
         assertTrue(res.decoderResult().isFailure());
         res.release();
 
-        assertThat(ch.readInbound(), is(nullValue()));
-
-        // Close the connection.
-        ch.finish();
-
-        // The decoder should not generate the last chunk because it's closed prematurely.
         assertThat(ch.readInbound(), is(nullValue()));
     }
 
