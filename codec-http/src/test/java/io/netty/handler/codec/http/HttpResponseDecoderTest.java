@@ -464,6 +464,30 @@ public class HttpResponseDecoderTest {
     }
 
     @Test
+    public void testPrematureClosureWithChunkedEncodingAndAggregator() throws Exception {
+        EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder(), new HttpObjectAggregator(1024));
+
+        // Write the partial response.
+        ch.writeInbound(Unpooled.copiedBuffer(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678", CharsetUtil.US_ASCII));
+        ch.finish();
+
+        FullHttpResponse res = ch.readInbound();
+        assertThat(res.protocolVersion(), sameInstance(HttpVersion.HTTP_1_1));
+        assertThat(res.status(), is(HttpResponseStatus.OK));
+        assertTrue(res.decoderResult().isFailure());
+        res.release();
+
+        assertThat(ch.readInbound(), is(nullValue()));
+
+        // Close the connection.
+        ch.finish();
+
+        // The decoder should not generate the last chunk because it's closed prematurely.
+        assertThat(ch.readInbound(), is(nullValue()));
+    }
+
+    @Test
     public void testLastResponseWithEmptyHeaderAndEmptyContent() {
         EmbeddedChannel ch = new EmbeddedChannel(new HttpResponseDecoder());
         ch.writeInbound(Unpooled.copiedBuffer("HTTP/1.1 200 OK\r\n\r\n", CharsetUtil.US_ASCII));
